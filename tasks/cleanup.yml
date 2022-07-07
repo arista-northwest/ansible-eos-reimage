@@ -1,0 +1,6 @@
+---
+- name: cleanup temp files
+  block:
+    - name: removing temp files
+      debug:
+        msg: "removing temp files"

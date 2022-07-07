@@ -1,0 +1,200 @@
+---
+# (4.25.4M -> 4.28.1F)
+- name: "EOS upgrade playbook"
+  hosts: eos
+  become: true
+  gather_facts: no
+
+  tasks:
+    - include_tasks: tasks/add_host_keys.yml
+
+    - name: Define facts
+      set_fact:
+        boot_last_image: ""
+        boot_config_image: ""
+        image_installed: false
+        upgrade_ready: false
+
+    - name: Make sure switch is running EOS
+      assert:
+        that: ansible_network_os == 'arista.eos.eos'
+        fail_msg: "Network OS is not EOS"
+
+    - name: Gather EOS facts
+      arista.eos.eos_facts:
+
+    - name: Creating fact to see if the switch needs to be upgraded to {{ target_version }}
+      ansible.builtin.meta: end_host
+      when: target_version == ansible_net_version
+
+    - name: Make sure running image is the same as boot-config
+      block:
+        - name: Getting running and configured image
+          eos_command:
+            commands:
+              - bash dmesg | sed -nr 's/^.*Command line:\s+SWI=(\S+).*$/\1/p'
+              - show boot-config | grep Software\ image | awk '{ print $3}'
+          register: __boot_image
+
+        - name: Set boot facts
+          set_fact:
+            boot_last_image: "{{ __boot_image.stdout[0] }}"
+            boot_config_image: "{{ __boot_image.stdout[1] }}"
+
+        - name: Verify boot and running image match
+          assert:
+            that: boot_last_image == boot_config_image
+
+    - name: Stage image on local node
+      block:
+        - name: Get SWI
+          ansible.builtin.get_url:
+            url: "{{ image_swi_source }}"
+            dest: /tmp/{{ image_swi_filename }}
+        
+        - name: Get MD5
+          ansible.builtin.get_url:
+            url: "{{ image_md5_source }}"
+            dest: /tmp/{{ image_md5_filename }}
+        
+        - name: Fix filename
+          ansible.builtin.shell:
+            cmd: sed -i 's/v\?EOS\(-lab\)\?.swi/{{ image_swi_filename }}/' /tmp/{{ image_md5_filename }}
+
+    - name: Check free space in device
+      block:
+        - name: Get image size
+          ansible.builtin.shell:
+            cmd: du -s /tmp/{{ image_swi_filename }} | awk '{print $1}'
+          register: imagesize
+
+        - name: Get flash space available
+          eos_command:
+            commands:
+              - bash timeout 30 df -P /mnt/flash | tail -1 | awk '{print $4}'
+          register: freespace
+
+        - name: check flash space
+
+          fail:
+            msg: "Not enough free space"
+          when: imagesize.stdout[0]|int * 1.1 > freespace.stdout[0]|int
+              
+      rescue:
+        - import_tasks: tasks/cleanup.yml
+
+        - name: Abort playbook
+          #ansible.builtin.meta: end_host
+          fail:
+            msg: "Aborting playbook"
+
+    - name: Install image
+      block:
+
+        - name: Check if image is on flash
+          eos_command:
+            commands:
+              - bash if [ -e /mnt/flash/{{ image_swi_filename }} ]; then echo 1; else echo 0; fi
+          register: target_swi_exists
+
+        - name: Copy image
+          ansible.builtin.shell:
+            cmd: sshpass -p "{{ ansible_password }}" scp /tmp/{{ image_swi_filename }} /tmp/{{ image_md5_filename }} {{ ansible_user }}@{{ inventory_hostname }}:/mnt/flash/
+          when: not target_swi_exists.stdout[0]
+
+        - name: Verify image
+          eos_command:
+            commands:
+              - bash cd /mnt/flash && md5sum -c {{ image_md5_filename }}
+          register: image_check
+
+        - name: Check verify output
+          assert:
+            that: "'OK' in image_check.stdout[0]"
+            fail_msg: "The image checksum did not match"
+
+        - name: Install image
+          eos_config:
+            lines:
+              - boot system flash:{{ image_swi_filename }}
+
+        - name: Mark image as installed
+          set_fact:
+            image_installed: true
+      
+      rescue:
+        - name: Print when errors
+          ansible.builtin.debug:
+            msg:
+              - Upgrade failed. See errors above
+
+    - name: Enter maintenance mode
+      block:
+        ###
+        # Check BGP neighbors for maintenance mode
+        # Check ISIS overload bit on neighbor
+
+        # TODO: Loop through ISIS instances
+        - name: Set overload bit
+          eos_config:
+            lines:
+              - set-overload-bit
+            parents: router isis {{ isis_instance }}
+        
+        - name: Enter maintenance mode
+          eos_config:
+            lines:
+              - quiesce
+            parents:
+              - maintenance
+              - unit System
+
+        - name: check traffic
+          debug:
+            msg: "TODO: Check traffic counters"
+        
+        - name: mark upgrade ready
+          set_fact:
+            upgrade_ready: true
+      rescue:
+        - name: Print when errors
+          ansible.builtin.debug:
+            msg:
+              - Maintenace mode failed. See errors above
+      
+      when: image_installed
+
+    - name: Reload
+      eos_command:
+        commands:
+          - write
+          - reload now
+    
+      when: upgrade_ready
+    
+    - name: Rollback
+      block:
+        # do a configuration checkpoint
+
+        # TODO: Loop through ISIS instances
+        - name: Un-set overload bit
+          eos_config:
+            lines:
+              - default set-overload-bit
+            parents: router isis Lab
+        
+        - name: Clear maintenance mode
+          eos_config:
+            lines:
+              - no quiesce
+            parents:
+              - maintenance
+              - unit System
+
+        - name: Restore boot-config
+          eos_config:
+            lines:
+              - boot system {{ boot_last_image }}
+          when:  boot_last_image != boot_config_image
+
+      when: not upgrade_ready

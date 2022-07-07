@@ -1,0 +1,6 @@
+---
+- name: Rollback image upgrade
+  block:
+    - name: restore checkpoint
+      debug:
+        msg: "restoring to checkpoint"
